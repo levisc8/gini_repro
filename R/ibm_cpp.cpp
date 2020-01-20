@@ -52,7 +52,7 @@ Rcpp::DataFrame iterate_car_ibm(
                         size = 1);
     int repr_n = sum(repr);
 
-    seeds
+    seeds = Rcpp::rpois()
 
     if(i == 0) {
 
