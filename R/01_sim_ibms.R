@@ -6,6 +6,8 @@
 # and one mammal. below are parameters that define each vital rate for the thistle.
 
 # Carlina parameters -------------
+# Julius is testing this
+# Test from within RStudio
 
 library(tibble)
 
