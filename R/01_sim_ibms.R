@@ -113,6 +113,9 @@ id  <- seq_len(length(z))
 
 pop_size_t <- init_pop_size
 
+# I add types to the NAs so it's easier to remember data types when I'm translating
+# to another language (e.g. c++). They function exactly the same NAs.
+
 sim_data <- tibble(
   id    = id,
   z     = z,
@@ -567,3 +570,208 @@ stopifnot(! any(sim_data$repr == 1 & is.na(sim_data$z1), na.rm = TRUE))
 stopifnot(! any(sim_data$repr == 1 & sim_data$surv == 0, na.rm = TRUE))
 
 saveRDS(sim_data, file = 'data/soay_ibm_data.rds')
+
+
+# Iceplant IBM -----------
+# Carpobrotus spp from Israeli drone data
+
+set.seed(121)
+
+ice_par_true <- c(
+  grow_int   = 0.01566,
+  grow_z     = 0.89849,
+  grow_sd_z  = -0.1754,
+  surv_int   = 2.7897,
+  surv_z     = 0.7312,
+  flow_int   = 1.021,
+  flow_z     = 1.103,
+  flow_n_int = 1.664,
+  flow_n_z   = 0.753,
+  est_p      = 0.0084,
+  recr_mean  = -3.103,
+  recr_sd    = 1.064
+)
+
+# some helper functions
+
+s_z <- function(z, par) {
+
+  lin_p <- par['surv_int'] + par['surv_z'] * z
+  return(1/(1 + exp( - lin_p )))
+
+}
+
+flow_z <- function(z, par) {
+
+  lin_p <- par['flow_int'] + par['flow_z'] * z
+  return(1/(1 + exp( - lin_p )))
+
+}
+
+flow_n_z <- function(z, par) {
+
+  exp(par['flow_n_int'] + par['flow_n_z'] * z)
+
+}
+
+# Set up the simulation parameters
+
+y             <- 1
+n_yrs         <- 200
+init_pop_size <- 50
+
+# initial population sizes and ages. We assume they all come from seeds
+
+z   <- rnorm(init_pop_size,
+             mean = ice_par_true["recr_mean"],
+             sd   = ice_par_true["recr_sd"])
+
+id  <- seq_len(length(z))
+
+# calculate initial pop size and mean size
+
+pop_size_t <- init_pop_size
+
+sim_data <- tibble(
+  id     = id,
+  z      = z,
+  repr   = rep(NA_integer_, length(z)),
+  surv   = rep(NA_integer_, length(z)),
+  flow_n = rep(NA_integer_, length(z)),
+  z1     = rep(NA_real_,    length(z)),
+  age    = rep(0,           length(z)),
+  alive  = rep(TRUE,        length(z)),
+  yr     = rep(1L,          length(z))
+)
+
+pop_size <- dim(sim_data)[1]
+id       <- sim_data$id
+age      <- sim_data$age
+z        <- sim_data$z
+
+
+while(y < n_yrs & dim(sim_data)[1] < 100000) {
+
+  # Hold the data somewhere temporarily
+  temp <- list(
+    id     = id,
+    z      = z,
+    repr   = rep(NA_integer_, length(z)),
+    surv   = rep(NA_integer_, length(z)),
+    flow_n = rep(NA_integer_, length(z)),
+    z1     = rep(NA_integer_, length(z)),
+    age    = age,
+    alive  = rep(TRUE,        length(z)),
+    yr     = rep(y,           length(z))
+  )
+
+  # Reproduction happens first in this model
+
+  temp$repr <- rbinom(n    = pop_size,
+                      prob = flow_z(z, ice_par_true),
+                      size = 1)
+
+  flow_ind  <- which(temp$repr == 1)
+  repr_n    <- length(flow_ind)
+
+  # Get the number of recruits. We'll assign them ages, etc in a minute.
+
+  temp$flow_n[flow_ind] <- rpois(repr_n,
+                                 flow_n_z(temp$z[flow_ind],
+                                          ice_par_true))
+
+  flow_tot              <- sum(temp$flow_n, na.rm = TRUE)
+
+  n_recr                <- rbinom(n    = 1,
+                                  size = flow_tot,
+                                  prob = ice_par_true['est_p'])
+  # The plants must now survive and grow.
+
+  temp$surv             <- rbinom(n    = pop_size,
+                                  prob = s_z(z, ice_par_true),
+                                  size = 1)
+
+  surv_ind              <- which(temp$surv == 1)
+
+  temp$alive            <- as.logical(temp$surv)
+
+  # Ice plant differs from the others in that growth becomes more determinstic
+  # as the plants get bigger. The SD is a function of size in this model, and the
+  # coefficient is negative
+
+  E_z1                  <- ice_par_true['grow_int'] +
+                           ice_par_true['grow_z'] *
+                           temp$z[surv_ind]
+  sd_z1                 <- exp(2 * ice_par_true['grow_sd_z'] * temp$z[surv_ind])
+
+  temp$z1[surv_ind]     <- rnorm(n    = length(surv_ind),
+                                 mean = E_z1,
+                                 sd   = sd_z1)
+
+  # Now, if there are any, give recruits a size and package them up
+  # to fit with the surviving adults
+
+  if(n_recr > 0) {
+
+    recr_z      <- rnorm(n_recr,
+                         mean = ice_par_true['recr_mean'],
+                         sd   = ice_par_true['recr_sd'])
+
+    rc_id_start <- max(sim_data$id)
+
+    rc_id       <- seq(rc_id_start,
+                       (rc_id_start + n_recr - 1),
+                       by = 1)
+
+    temp$id     <- c(temp$id, rc_id)
+    temp$z      <- c(temp$z, rep(NA_real_,
+                                 n_recr))
+    temp$repr   <- c(temp$repr, rep(NA_integer_,
+                                    n_recr))
+    temp$flow_n <- c(temp$flow_n, rep(NA_integer_,
+                                     n_recr))
+    temp$surv   <- c(temp$surv, rep(NA_integer_,
+                                    n_recr))
+    temp$z1     <- c(temp$z1, recr_z)
+    temp$age    <- c(temp$age,
+                     rep(0, n_recr))
+    temp$alive  <- c(temp$alive, rep(TRUE,
+                                     n_recr))
+    temp$yr     <- c(temp$yr, rep(y, n_recr))
+
+
+  }
+
+
+  pop_size <- sum(temp$alive)
+
+  if(y == 1) {
+
+    sim_data$repr   <- temp$repr
+    sim_data$surv   <- temp$surv
+    sim_data$flow_n <- temp$flow_n
+    sim_data$z1     <- temp$z1
+    sim_data$age    <- temp$age
+    sim_data$alive  <- temp$alive
+    sim_data$yr     <- y
+
+  } else {
+    sim_data   <- rbind(sim_data,
+                        data.frame(temp))
+  }
+
+  id  <- sim_data$id[sim_data$yr == y & !is.na(sim_data$z1)]
+  z   <- sim_data$z1[sim_data$yr == y & !is.na(sim_data$z1)]
+  age <- sim_data$age[sim_data$yr == y & !is.na(sim_data$z1)] + 1
+
+  y <- y + 1
+
+}
+
+# Plants can die after reproducing, so we don't have nearly as many things to
+# check (I don't think, but may regret those words later...)
+
+stopifnot(! any(sim_data$repr == 1 & is.na(sim_data$flow_n), na.rm = TRUE))
+stopifnot(! any(sim_data$repr == 1 & is.na(sim_data$z), na.rm = TRUE))
+
+saveRDS(sim_data, 'data/carpobrotus_ibm_data.rds')
