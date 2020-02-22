@@ -376,6 +376,322 @@ c_z1z <- function(z1, z, m_par) {
   return(p_den_rcsz)
 }
 
+master_data <- data.frame(matrix(ncol = 16, nrow = 0))
+names(master_data) <- c("Iteration", "id", "z", "repr", "surv", "z1", "age",
+                        "sex", "alive", "yr", "off1", "off2", "gini1", "gini2", 
+                        "pop_size", 'total_offspring')
+
+set.seed(121)
+
+for (iterate in 1:50) {
+  # This one differs slightly in that there is a maternal effect of size
+  # on recruit size.
+  
+  yr            <- 1
+  n_yrs         <- 200
+  init_pop_size <- 50
+  
+  # initial population sizes and ages. The 3.2 is pulled from the script in
+  # the IPM book. I am not entirely sure why they picked that size for the
+  # parent of them all.
+  
+  z   <- rnorm(init_pop_size,
+               mean = soa_par_true["rcsz_int"] + soa_par_true['rcsz_z'] * 3.2,
+               sd   = soa_par_true["rcsz_sd"])
+  
+  id  <- seq_len(length(z))
+  
+  # calculate initial pop size and mean size
+  
+  pop_size_t <- init_pop_size
+  
+  sim_data <- tibble(
+    id    = id,
+    z     = z,
+    repr  = rep(NA_integer_, length(z)),
+    surv  = rep(NA_integer_, length(z)),
+    z1    = rep(NA_real_,    length(z)),
+    age   = rep(0,           length(z)),
+    sex   = rbinom(length(z), prob = 1/2, size = 1),
+    alive = rep(TRUE,        length(z)),
+    yr    = rep(1L,          length(z)),
+    off1  = rep(NA_real_, length(z)),
+    off2  = rep(NA_real_, length(z)),
+    gini1 = rep(NA_real_, length(z)),
+    gini2 = rep(NA_real_, length(z))
+  )
+  
+  pop_size <- dim(sim_data)[1]
+  id       <- sim_data$id
+  age      <- sim_data$age
+  z        <- sim_data$z
+  sex      <- sim_data$sex
+  
+  # A constant to define the minimum age an individual has to be to reproduce.
+  # this is to keep the model from generating 0 year old individuals
+  # who are reproductive (which I think is nonsense). Can/should be adjusted
+  # to explore implications
+  
+  min_repr_age <- 1
+  
+  # iterate the model using the 'true' parameters and store data in a
+  # list
+  
+  y <- 1
+  
+  while(y < n_yrs && dim(sim_data)[1] < 15000) {
+    
+    # Temporary data list to store data from a particular year
+    
+    temp <- list(
+      id    = id,
+      z     = z,
+      repr  = rep(NA_integer_, pop_size),
+      surv  = rep(NA_integer_, pop_size),
+      z1    = rep(NA_real_, pop_size),
+      age   = age,
+      sex   = sex,
+      alive = rep(NA, pop_size),
+      yr    = rep(y, pop_size),
+      off1  = rep(NA_real_, pop_size),
+      off2  = rep(NA_real_, pop_size),
+      gini1 = rep(NA_real_, pop_size),
+      gini2 = rep(NA_real_, pop_size)
+    )
+    
+    # The IBM here looks a little different because the census timing is post-reproductive.
+    # thus, survival and growth happen first, and then we figure out who reproduces.
+    # It is helpful that reproduction is not fatal in this example.
+    
+    # However, for the purposes of our simulation, I'm going to switch things up a little bit:
+    # instead, we're going to calculate their growth, then *potential* reproductive output, 
+    # followed by a skewing of that reproductive output. Then we're going to kill 'em off,
+    # and only allow the reproducers that survived to produce offspring. Make sense?
+    
+    temp$surv <- rbinom(n = pop_size,
+                        prob = s_z(temp$z,
+                                   soa_par_true),
+                        size = 1)
+    
+    # let them grow (if they're still alive!)
+    
+    E_z1                    <- soa_par_true['grow_int'] + soa_par_true['grow_z'] * temp$z
+    
+    temp$z1                 <- rnorm(length(z), mean = E_z1, sd = soa_par_true['grow_sd'])
+    
+    temp$z1[temp$surv == 0] <- NA_real_
+    
+    # generate binomial random number for the probability of reproducing,
+    # where the probability of reproducing depends on your size z and sex.
+    
+    repr_ind <- which(temp$surv == 1 &
+                        temp$sex  == 1 &
+                        temp$age  >= min_repr_age)
+    
+    temp$repr[repr_ind] <- rbinom(n    = length(repr_ind),
+                                  prob = p_bz(temp$z[repr_ind],
+                                              soa_par_true),
+                                  size = 1)
+    
+    # now we add in some skewed reproductive output to fit a Chi-squared distribution. This lets us
+    # skew reproduction towards fewer individuals
+    
+    if (sum(temp$repr, na.rm = TRUE) > 0) { #Conditioning it on there being any offspring at all
+      original    <- temp$repr[which(temp$repr == 1)] #Taking reproductive individuals as producing 1 offspring
+      sumOriginal <- sum(original) 
+      
+      chisqDist <- rchisq(n = length(original), df = 15) #Should increase inequality a bit
+      sumChisq  <- sum(chisqDist)
+      final     <- chisqDist*sumOriginal/sumChisq 
+      #^This standardizes by the sum so that the total offspring are equal to the original (no growth difference)
+      
+      temp$off1[which(temp$repr == 1)]  <- final
+      temp$gini1[which(temp$repr == 1)] <- gini(final) 
+      
+      chisqDist <- rchisq(n = length(original), df = 5) #Should increase inequality by more
+      sumChisq  <- sum(chisqDist)
+      final     <- chisqDist*sumOriginal/sumChisq 
+      
+      temp$off2[which(temp$repr == 1)] <- final
+      temp$gini2[which(temp$repr == 1)] <- gini(final)
+      
+      temp$repr <- temp$off1
+    } 
+    
+    # Time for a stochastic mortality event. Roughly every ten years, we'll get a random ~10% mortality event
+    
+    diceRoll <- sample(seq(1, 10), size = 1)
+    
+    if (diceRoll == 10) {
+      
+      randomDead   <- rep(0, length(temp$surv))
+      aliveThusFar <- which(temp$surv == 1)
+      
+      randomDead[aliveThusFar] <- rbinom(n = length(aliveThusFar), 
+                                         size = 1, 
+                                         prob = 0.9) #Kills off ~10% of the remaining alive
+      
+      differences <- which(temp$surv == 1 & randomDead == 0) #Ones that need correcting
+      
+      temp$surv[differences] <- 0
+      temp$z1[differences] <- NA_real_
+      temp$repr[differences] <- NA_integer_
+    }
+    
+    # number of fertile adults
+    
+    sex_ind  <- which(temp$repr > 0) 
+    #^Changed this from "== 1" because of non-integer values in post-transform reproduction
+    recr_sex <- rep(NA_integer_, pop_size)
+    
+    recr_sex[sex_ind] <- rbinom(n    = length(sex_ind),
+                                size = 1,
+                                prob = 0.5)
+    
+    # generate recruits, assign size. Another key difference
+    # from this model vs the book model is that they discard males, while this
+    # model retains them.
+    
+    real_recr_ind <- which(!is.na(recr_sex))
+    realized_recr <- rep(NA_integer_, pop_size) 
+    
+    realized_recr[real_recr_ind] <- temp$repr[real_recr_ind]*rbinom(n    = length(real_recr_ind),
+                                                                    size = 1,
+                                                                    prob = pr_z(soa_par_true))
+    #^Here we now multiply the 0/1 of survival by the total offspring (for post-standardized cases)
+    
+    use_z_ind     <- which(temp$sex  == 1 & temp$surv     == 1 &
+                             temp$repr > 0 & realized_recr > 0)
+    
+    total_realized_offspring <- round(sum(temp$repr[use_z_ind], na.rm = TRUE))
+    
+    # generate new recruit sizes and get an index to start their IDs with.
+    # Index gets used later
+    
+    rc_sz <- c()
+    
+    if (length(use_z_ind) > 1 & total_realized_offspring > 0) {
+      for (offspring in 1:total_realized_offspring) {
+        sampledSize <- sample(temp$z[use_z_ind], 
+                              size = 1, 
+                              prob = temp$repr[use_z_ind]) 
+        #^Sample a reproductive adult size with probability proportional to its allocation of reproduction
+        rc_sz       <- c(rc_sz, rnorm(n = 1, 
+                                      mean = soa_par_true["rcsz_int"] +
+                                        soa_par_true["rcsz_z"]*sampledSize,
+                                      sd = soa_par_true["rcsz_sd"]))
+        #^Generate offspring size based off that adult
+      } 
+    } else if (length(use_z_ind) == 1 & total_realized_offspring > 0) {
+      for (offspring in 1:total_realized_offspring) {
+        sampledSize <- temp$z[use_z_ind]
+        rc_sz       <- c(rc_sz, rnorm(n = 1, 
+                                      mean = soa_par_true["rcsz_int"] +
+                                        soa_par_true["rcsz_z"]*sampledSize,
+                                      sd = soa_par_true["rcsz_sd"]))
+        #^This is specifically when there's only one parent; "sample" yells at you for providing one probability
+      }
+      
+    }
+    
+    # They lived! Time to increment the age variable.
+    temp$age[temp$surv == 1] <- temp$age[temp$surv == 1] + 1
+    
+    if(length(rc_sz) > 0) {
+      
+      rc_id_start <- max(sim_data$id) + 1
+      recr_n      <- length(rc_sz)
+      
+      # Now, append all the info to temp
+      rc_id <- seq(rc_id_start,
+                   (rc_id_start + length(rc_sz) - 1),
+                   by = 1)
+      temp$id <- c(temp$id, rc_id)
+      temp$z  <- c(temp$z, rep(NA_real_, recr_n))
+      temp$repr <- c(temp$repr,
+                     rep(NA_integer_,
+                         recr_n))
+      temp$surv  <- c(temp$surv, rep(NA_integer_,
+                                     recr_n))
+      temp$z1    <- c(temp$z1, rc_sz)
+      temp$age   <- c(temp$age,
+                      rep(0, recr_n))
+      temp$alive <- c(temp$alive,
+                      rep(TRUE,
+                          recr_n))
+      if (total_realized_offspring <= length(use_z_ind)) {
+        temp$sex <- c(temp$sex, 
+                      recr_sex[sample(use_z_ind, size = total_realized_offspring)])
+      } else {
+        temp$sex <- c(temp$sex, 
+                      recr_sex[sample(use_z_ind, size = total_realized_offspring, replace = TRUE)])
+      }
+      temp$yr    <- c(temp$yr,
+                      rep(y, recr_n))
+      temp$off1  <- c(temp$off1, 
+                      rep(NA_real_, recr_n))
+      temp$off2  <- c(temp$off2, 
+                      rep(NA_real_, recr_n))
+      temp$gini1 <- c(temp$gini1, 
+                      rep(NA_real_, recr_n))
+      temp$gini2 <- c(temp$gini2, 
+                      rep(NA_real_, recr_n))
+      
+      
+      
+    }
+    
+    
+    temp$alive             <- as.logical(temp$surv)
+    
+    if(y == 1) {
+      
+      sim_data$repr  <- temp$repr
+      sim_data$surv  <- temp$surv
+      sim_data$z1    <- temp$z1
+      sim_data$age   <- temp$age
+      sim_data$alive <- temp$alive
+      sim_data$sex   <- temp$sex
+      sim_data$yr    <- y
+      
+    } else {
+      sim_data   <- rbind(sim_data,
+                          data.frame(temp))
+    }
+    
+    # Set up next year's simulation
+    
+    id       <- sim_data$id[sim_data$yr == y & !is.na(sim_data$z1)]
+    z        <- sim_data$z1[sim_data$yr == y & !is.na(sim_data$z1)]
+    age      <- sim_data$age[sim_data$yr == y & !is.na(sim_data$z1)]
+    sex      <- sim_data$sex[sim_data$yr == y & !is.na(sim_data$z1)]
+    pop_size <- length(sim_data$z[sim_data$yr == y & sim_data$alive])
+    
+    y <- y + 1
+    
+  }
+  
+  # Series of sanity checks for the data. These are quick and dirty - you will
+  # want to check them a bit more thoroughly I'd imagine.
+  stopifnot(! any(sim_data$repr == 1 & sim_data$age < min_repr_age, na.rm = TRUE))
+  stopifnot(! any(sim_data$repr == 1 & sim_data$sex == 0, na.rm = TRUE))
+  stopifnot(! any(sim_data$repr == 1 & is.na(sim_data$z1), na.rm = TRUE))
+  stopifnot(! any(sim_data$repr == 1 & sim_data$surv == 0, na.rm = TRUE))
+  
+  Iteration <- rep(iterate, nrow(sim_data))
+  sim_data <- cbind(Iteration, sim_data)
+  
+  master_data <- rbind(master_data, sim_data)
+}
+
+master_data <- master_data %>%
+  group_by(Iteration, yr) %>%
+  mutate(pop_size = n())
+
+ggplot(master_data, aes(x = yr, y = pop_size, group = Iteration)) + geom_line()
+
+## Here is the original code, pre-iteration ##
+
 # This one differs slightly in that there is a maternal effect of size
 # on recruit size.
 
